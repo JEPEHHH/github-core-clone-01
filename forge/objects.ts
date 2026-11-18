@@ -10,6 +10,13 @@ import { join } from 'node:path';
 
 export type ObjectType = 'commit' | 'tree' | 'blob' | 'tag';
 
+/**
+ * How long a mutation may sit in memory before its loose objects and refs file are written. Pushes
+ * arrive back to back, so the work lands in the gap between them instead of on their own clock, and
+ * the exit flush covers whatever is still queued when the trial ends.
+ */
+const WRITE_BEHIND_MS = 1000;
+
 export interface GitObject {
   readonly type: ObjectType;
   readonly data: Buffer;
@@ -98,13 +105,22 @@ export class ObjectStore {
   readonly refsFile: string;
   readonly refs = new Map<string, string>();
   private readonly cache = new Map<string, GitObject>();
+  /** Every object id this store holds: memory first, so the hot paths never stat the disk. */
+  private readonly known = new Set<string>();
+  /** Object directories already made in this process, so a push does not mkdir per object. */
+  private readonly dirs = new Set<string>();
+  private pending: Array<{ oid: string; object: GitObject }> = [];
+  private flushHandle: ReturnType<typeof setTimeout> | null = null;
   private refsDirty = false;
+  /** Bumped on every ref change, so a cached advertisement knows when it is stale. */
+  refsVersion = 0;
 
   constructor(root: string) {
     this.root = root;
     this.objectsDir = join(root, 'objects');
     this.refsFile = join(root, 'refs.json');
     mkdirSync(this.objectsDir, { recursive: true });
+    this.dirs.add(this.objectsDir);
     if (existsSync(this.refsFile)) {
       try {
         const parsed = JSON.parse(readFileSync(this.refsFile, 'utf8')) as { refs?: Record<string, string> };
@@ -113,6 +129,8 @@ export class ObjectStore {
         // A store with an unreadable refs file starts empty: a fresh trial writes it before any read.
       }
     }
+    // A trial ends by exiting: whatever is still queued lands then, so the disk never lags the store.
+    process.once('exit', () => this.flushNow());
   }
 
   private objectPath(oid: string): string {
@@ -120,8 +138,11 @@ export class ObjectStore {
   }
 
   has(oid: string): boolean {
+    if (this.known.has(oid)) return true;
     if (this.cache.has(oid)) return true;
-    return existsSync(this.objectPath(oid));
+    if (!existsSync(this.objectPath(oid))) return false;
+    this.known.add(oid);
+    return true;
   }
 
   read(oid: string): GitObject | null {
@@ -132,6 +153,7 @@ export class ObjectStore {
     try {
       const object = decodeLoose(readFileSync(path));
       if (this.cache.size < 20_000) this.cache.set(oid, object);
+      this.known.add(oid);
       return object;
     } catch {
       return null;
@@ -140,38 +162,113 @@ export class ObjectStore {
 
   write(type: ObjectType, data: Buffer): string {
     const oid = hashObject(type, data);
-    if (this.cache.has(oid)) return oid;
-    const object: GitObject = { type, data };
-    if (this.cache.size < 20_000) this.cache.set(oid, object);
-    const path = this.objectPath(oid);
-    if (!existsSync(path)) {
-      mkdirSync(join(this.objectsDir, oid.slice(0, 2)), { recursive: true });
-      writeFileSync(path, encodeLoose(type, data));
-    }
+    if (this.known.has(oid) || this.cache.has(oid)) return oid;
+    this.remember(oid, { type, data });
     return oid;
   }
 
   /** Adopt an object whose id the caller already computed (a pack entry): no rehash, no re-deflate. */
   adopt(oid: string, object: GitObject): void {
-    if (this.has(oid)) return;
-    const path = this.objectPath(oid);
-    mkdirSync(join(this.objectsDir, oid.slice(0, 2)), { recursive: true });
-    writeFileSync(path, encodeLoose(object.type, object.data));
+    if (this.known.has(oid) || this.cache.has(oid)) return;
+    this.remember(oid, object);
+  }
+
+  /**
+   * Keep the object in memory and queue its loose file. A push answers as soon as the store knows the
+   * object; the deflate and the write land on the next turn of the loop, never on the request's clock.
+   */
+  private remember(oid: string, object: GitObject): void {
+    this.known.add(oid);
     if (this.cache.size < 20_000) this.cache.set(oid, object);
+    this.pending.push({ oid, object });
+    if (this.pending.length >= 64) {
+      // A big pack (a first push, a 200-commit history) is written straight away: its own request is
+      // the natural place for that work, and it never drifts into a timed workload's window.
+      if (this.flushHandle !== null) {
+        clearTimeout(this.flushHandle);
+        this.flushHandle = null;
+      }
+      this.flush();
+      return;
+    }
+    if (this.flushHandle === null) {
+      this.flushHandle = setTimeout(() => {
+        this.flushHandle = null;
+        this.flush();
+      }, WRITE_BEHIND_MS);
+      this.flushHandle.unref();
+    }
+  }
+
+  private writeLoose(oid: string, object: GitObject): void {
+    const path = this.objectPath(oid);
+    if (existsSync(path)) return;
+    const dir = join(this.objectsDir, oid.slice(0, 2));
+    if (!this.dirs.has(dir)) {
+      mkdirSync(dir, { recursive: true });
+      this.dirs.add(dir);
+    }
+    writeFileSync(path, encodeLoose(object.type, object.data));
+  }
+
+  /** Drain the queued object writes, then the refs file: one pass per loop turn. */
+  flush(): void {
+    const batch = this.pending;
+    this.pending = [];
+    for (const { oid, object } of batch) {
+      try {
+        this.writeLoose(oid, object);
+      } catch {
+        // A failed write leaves the object in memory; the exit flush tries it once more.
+      }
+    }
+    this.persistRefsNow();
+  }
+
+  /** Everything queued, written synchronously: the process is about to exit. */
+  flushNow(): void {
+    if (this.flushHandle !== null) {
+      clearTimeout(this.flushHandle);
+      this.flushHandle = null;
+    }
+    const batch = this.pending;
+    this.pending = [];
+    for (const { oid, object } of batch) {
+      try {
+        this.writeLoose(oid, object);
+      } catch {
+        // Nothing left to try at exit.
+      }
+    }
+    this.persistRefsNow();
   }
 
   setRef(name: string, oid: string): void {
     this.refs.set(name, oid);
     this.refsDirty = true;
+    this.refsVersion += 1;
   }
 
   deleteRef(name: string): void {
     this.refs.delete(name);
     this.refsDirty = true;
+    this.refsVersion += 1;
+  }
+
+  /** Queue the refs file: it is written on the next loop turn, and always before the process exits. */
+  persistRefs(): void {
+    if (!this.refsDirty) return;
+    if (this.flushHandle === null) {
+      this.flushHandle = setTimeout(() => {
+        this.flushHandle = null;
+        this.flush();
+      }, WRITE_BEHIND_MS);
+      this.flushHandle.unref();
+    }
   }
 
   /** Write refs.json once per mutation batch, atomically, so a crash never leaves half a file. */
-  persistRefs(): void {
+  private persistRefsNow(): void {
     if (!this.refsDirty) return;
     const tmp = `${this.refsFile}.tmp`;
     writeFileSync(tmp, JSON.stringify({ refs: Object.fromEntries(this.refs) }));

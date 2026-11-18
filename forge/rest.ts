@@ -44,14 +44,16 @@ export function sendJson(
   body: unknown,
   headers: Readonly<Record<string, string>> = {},
 ): void {
-  const text = `${JSON.stringify(body)}\n`;
+  // One encode: the body goes out as the buffer that was measured, so no string is scanned for its
+  // byte length and then encoded a second time by the socket.
+  const payload = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
   res.writeHead(status, {
     'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
+    'content-length': payload.length,
     'x-github-request-id': requestId(),
     ...headers,
   });
-  res.end(text);
+  res.end(payload);
 }
 
 /** A reply with no body at all (204), still carrying the request id the protocol checks read. */
