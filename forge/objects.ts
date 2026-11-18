@@ -181,9 +181,11 @@ export class ObjectStore {
     this.known.add(oid);
     if (this.cache.size < 20_000) this.cache.set(oid, object);
     this.pending.push({ oid, object });
-    if (this.pending.length >= 64) {
-      // A big pack (a first push, a 200-commit history) is written straight away: its own request is
-      // the natural place for that work, and it never drifts into a timed workload's window.
+    if (this.pending.length >= 8192) {
+      // A memory ceiling, not a scheduling point: 200 pushes of a 1 KiB change queue ~600 objects and
+      // this used to fire on every one of them, putting a batch of deflates and writes inside the
+      // request that happened to cross the line. The timer below owns the drain; the exit flush covers
+      // whatever is still queued when a trial ends.
       if (this.flushHandle !== null) {
         clearTimeout(this.flushHandle);
         this.flushHandle = null;

@@ -172,8 +172,24 @@ function commitLevels(store: ObjectStore, wants: readonly string[], maxLevel: nu
   return levels;
 }
 
+/**
+ * Fetch replies, keyed by the ref generation plus the request's own argument lines. A clone workload
+ * asks the same question back to back, and rebuilding the pack spends zlib, SHA-1 and Buffer.concat on
+ * bytes the store already produced. A ref move bumps refsVersion, and a version change drops the whole
+ * map, so a stale pack can never answer a push that landed in between.
+ */
+const fetchReplies = new Map<string, Buffer>();
+let fetchRepliesVersion = -1;
+
 /** fetch: the objects the wants reach and the haves do not, then shallow-info when depth cuts. */
 function fetch(store: ObjectStore, args: readonly string[]): Buffer {
+  if (store.refsVersion !== fetchRepliesVersion) {
+    fetchReplies.clear();
+    fetchRepliesVersion = store.refsVersion;
+  }
+  const cacheKey = args.join('\n');
+  const cached = fetchReplies.get(cacheKey);
+  if (cached !== undefined) return cached;
   const wants: string[] = [];
   const haves: string[] = [];
   const boundaries: string[] = [];
@@ -224,7 +240,11 @@ function fetch(store: ObjectStore, args: readonly string[]): Buffer {
   parts.push(pktLine('packfile\n'));
   parts.push(...sideband(pack));
   parts.push(FLUSH);
-  return Buffer.concat(parts);
+  const reply = Buffer.concat(parts);
+  // A handful of distinct asks per repository is all a trial makes; past that the map is churn.
+  if (fetchReplies.size >= 16) fetchReplies.clear();
+  fetchReplies.set(cacheKey, reply);
+  return reply;
 }
 
 /** Answer a POST /git-upload-pack body. Throws on a body that is not a v2 command. */
