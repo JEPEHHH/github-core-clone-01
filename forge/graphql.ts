@@ -423,11 +423,7 @@ function resolveField(target: Record<string, unknown>, name: string, args: Recor
   }
 
   // A field the type does not hold at all (an Issue's scalar fields are always known).
-  if (type === 'Issue' || type === 'PullRequest' || type === 'IssueComment' || type === 'Label') {
-    if (name in target) return known(target[name], scalarTypeOf(name));
-    ctx.errors.push({ message: `Cannot query field "${name}" on type "${type}".` });
-    return null;
-  }
+  if (name in target) return known(target[name], scalarTypeOf(name));
   ctx.errors.push({ message: `Cannot query field "${name}" on type "${type}".` });
   return null;
 }
