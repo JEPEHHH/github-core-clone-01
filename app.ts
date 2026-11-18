@@ -10,6 +10,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { Registry, forgeRoot } from './forge/repos.ts';
 import { HttpError, handleRest, readBody, sendJson } from './forge/rest.ts';
 import { handleMcp } from './forge/mcp.ts';
+import { handleGraphQL } from './forge/graphql.ts';
 import {
   RECEIVE_PACK_ADVERTISEMENT,
   RECEIVE_PACK_RESULT,
@@ -121,6 +122,15 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
       return;
     }
     await handleMcp(registry, req, res);
+    return;
+  }
+
+  if (path === '/api/graphql' || path === '/api/graphql/') {
+    if ((req.method ?? 'GET') !== 'POST') {
+      sendJson(res, 405, { message: 'Method Not Allowed' });
+      return;
+    }
+    await handleGraphQL(registry, req, res);
     return;
   }
 

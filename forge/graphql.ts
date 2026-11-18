@@ -6,7 +6,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Registry, RepoMeta } from './repos.ts';
 import type { ObjectStore } from './objects.ts';
-import { globalId, parseGlobalId, records, type IssueRecord, type PullRecord } from './db.ts';
+import { globalId, parseGlobalId, type IssueRecord, type PullRecord } from './db.ts';
 import {
   HttpError,
   createIssueRecord,
@@ -14,6 +14,7 @@ import {
   mergePullRecord,
   pullFiles,
   readBody,
+  records,
   repoJson,
   requestId,
 } from './rest.ts';
@@ -48,7 +49,10 @@ class GraphQLError extends Error {}
 
 class Reader {
   private index = 0;
-  constructor(private readonly text: string) {}
+  private readonly text: string;
+  constructor(text: string) {
+    this.text = text;
+  }
 
   private skip(): void {
     for (;;) {
